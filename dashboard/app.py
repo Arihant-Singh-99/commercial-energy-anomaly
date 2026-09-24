@@ -1,607 +1,1181 @@
-"""Streamlit dashboard for the Commercial Building Energy Copilot."""
-
-from __future__ import annotations
-
-import sys
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import joblib
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-DATA_PATH = ROOT / "data" / "capstone_smartgrid_20000.xlsx"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from impact import calculate_total_impact
-from integration import load_dashboard_data
-
+# ============================================================
+# PAGE SETUP
+# ============================================================
 
 st.set_page_config(
-    page_title="Commercial Building Energy Copilot",
-    page_icon=":material/bolt:",
+    page_title="Commercial Building Energy Intelligence",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-@st.cache_data(show_spinner="Loading and preparing energy data...")
-def load_pipeline(path: str) -> pd.DataFrame:
-    """Load standardized dashboard data once per source path.
-
-    The source can later be replaced with Team A/B's final DataFrame by
-    calling ``load_dashboard_data(final_dataframe)`` without changing the UI.
-    """
-    return load_dashboard_data(path)
+st.title("⚡ Commercial Building Energy Intelligence")
+st.caption(
+    "AI-powered commercial building energy anomaly detection, "
+    "impact analysis, and efficiency recommendations."
+)
 
 
-def _format_kwh(value: object) -> str:
-    """Format a numeric energy value without exposing NaN in the UI."""
-    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(number):
-        return "N/A"
-    return f"{number:,.1f} kWh"
+# ============================================================
+# PATHS
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Works when this file is placed in the project root.
+# Also supports the common project structure:
+# C:\...\commercial-energy-anomaly\
+#   model\
+#   data\
+MODEL_DIR = ROOT / "model"
+
+MODEL_PATH = MODEL_DIR / "final_isolation_forest_v2.joblib"
+SCALER_PATH = MODEL_DIR / "final_isolation_forest_scaler_v2.joblib"
+FEATURES_PATH = MODEL_DIR / "final_model_features_v2.joblib"
+
+DEFAULT_DATA_FILES = [
+    ROOT / "data" / "capstone_smartgrid_20000.xlsx",
+    ROOT / "data" / "dashboard_input.csv",
+    ROOT / "data" / "ml_output.csv",
+]
 
 
-def _format_value(value: object, suffix: str = "") -> str:
-    """Format a scalar value safely for anomaly detail fields."""
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"{value}{suffix}"
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
+@st.cache_resource
+def load_model_assets():
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+
+    if not SCALER_PATH.exists():
+        raise FileNotFoundError(f"Scaler not found: {SCALER_PATH}")
+
+    if not FEATURES_PATH.exists():
+        raise FileNotFoundError(f"Feature list not found: {FEATURES_PATH}")
+
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    features = joblib.load(FEATURES_PATH)
+
+    if not isinstance(features, list):
+        features = list(features)
+
+    return model, scaler, features
 
 
-def _display_occupancy(value: object) -> str:
-    """Display occupancy index as a percentage when available."""
-    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(number):
-        return "N/A"
-    return f"{number * 100:.1f}%"
+# ============================================================
+# DATA NORMALIZATION
+# ============================================================
 
+def normalize_columns(df):
+    df = df.copy()
 
-def _select_demo_anomaly(data: pd.DataFrame) -> tuple[object, pd.Series] | None:
-    """Select a real, high-severity anomaly for the presenter."""
-    if data.empty or "is_anomaly" not in data.columns:
-        return None
+    # Remove accidental duplicate columns while preserving the first.
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    anomalies = data[data["is_anomaly"].fillna(False)].copy()
-    if anomalies.empty:
-        return None
+    rename_map = {}
 
-    hours = pd.to_numeric(anomalies["hour"], errors="coerce")
-    occupancy = pd.to_numeric(anomalies["occupancy_index"], errors="coerce")
-    deviation = pd.to_numeric(anomalies["deviation_kwh"], errors="coerce")
-    severity = anomalies.get(
-        "severity",
-        pd.Series("LOW", index=anomalies.index),
-    )
-    severity_rank = severity.map(
-        {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    ).fillna(3)
-    ranking = pd.DataFrame(
-        {
-            "after_hours": (hours.ge(22) | hours.le(6)).astype(int),
-            "severity_rank": severity_rank,
-            "low_occupancy": occupancy.lt(0.15).fillna(False).astype(int),
-            "deviation": deviation.fillna(-np.inf),
-        },
-        index=anomalies.index,
-    )
-    selected_index = ranking.sort_values(
-        ["after_hours", "severity_rank", "low_occupancy", "deviation"],
-        ascending=[False, True, False, False],
-    ).index[0]
-    return selected_index, data.loc[selected_index]
+    for col in df.columns:
+        clean = str(col).strip()
+        low = clean.lower()
 
+        if low in {"timestamp", "datetime", "date_time", "time"}:
+            rename_map[col] = "timestamp"
 
-def _default_date_window(data: pd.DataFrame) -> tuple[object, object]:
-    """Choose a short, anomaly-centered initial view without changing data."""
-    timestamps = pd.to_datetime(data["timestamp"], errors="coerce", utc=True)
-    valid = timestamps.dropna()
-    if valid.empty:
-        return (None, None)
+        elif low in {
+            "building",
+            "building_id",
+            "building id",
+            "building_name",
+        }:
+            rename_map[col] = "building_id"
 
-    anomalies = data[data["is_anomaly"].fillna(False)].copy()
-    if not anomalies.empty:
-        anomaly_times = pd.to_datetime(
-            anomalies["timestamp"], errors="coerce", utc=True
-        ).dropna()
-        if not anomaly_times.empty:
-            anchor = anomaly_times.iloc[0]
+        elif low in {
+            "meter",
+            "meter_id",
+            "meter id",
+        }:
+            rename_map[col] = "meter_id"
+
+        elif low in {
+            "consumption",
+            "consumption_kwh",
+            "consumption (kwh)",
+            "energy",
+            "energy_kwh",
+            "energy consumption",
+        }:
+            rename_map[col] = "consumption_kwh"
+
+        elif low in {
+            "temperature",
+            "temp",
+            "temp_c",
+            "temperature_c",
+            "temperature (c)",
+        }:
+            rename_map[col] = "temp_c"
+
+        elif low in {
+            "humidity",
+            "humidity_pct",
+            "humidity (%)",
+        }:
+            rename_map[col] = "humidity_pct"
+
+        elif low in {
+            "occupancy",
+            "occupancy_index",
+            "occupancy (%)",
+        }:
+            rename_map[col] = "occupancy_index"
+
+        elif low in {
+            "holiday",
+            "is_holiday",
+        }:
+            rename_map[col] = "is_holiday"
+
+    df = df.rename(columns=rename_map)
+
+    # Required energy column.
+    if "consumption_kwh" not in df.columns:
+        possible = [
+            c for c in df.columns
+            if "consumption" in str(c).lower()
+            or "energy" in str(c).lower()
+        ]
+
+        if possible:
+            df["consumption_kwh"] = pd.to_numeric(
+                df[possible[0]], errors="coerce"
+            )
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce"
+        )
+
+    if "consumption_kwh" in df.columns:
+        df["consumption_kwh"] = pd.to_numeric(
+            df["consumption_kwh"],
+            errors="coerce"
+        )
+    if "building_id" not in df.columns:
+        if "meter_id" in df.columns:
+            meter_values = (
+                df["meter_id"]
+                .astype(str)
+                .str.strip()
+            )
+
+            def meter_to_building(meter):
+                try:
+                    number = int(meter.replace("M", ""))
+                    return f"Building {number}"
+                except (ValueError, TypeError):
+                    return f"Building {meter}"
+
+            df["building_id"] = meter_values.map(meter_to_building)
         else:
-            anchor = valid.iloc[0]
-    else:
-        anchor = valid.iloc[0]
+            df["building_id"] = "Building 1"
 
-    start = max(valid.min().date(), (anchor - pd.Timedelta(days=1)).date())
-    end = min(valid.max().date(), (anchor + pd.Timedelta(days=1)).date())
-    return (start, end)
+    if "meter_id" not in df.columns:
+        df["meter_id"] = df["building_id"].astype(str)
+
+    if "temp_c" not in df.columns:
+        df["temp_c"] = 25.0
+
+    if "humidity_pct" not in df.columns:
+        df["humidity_pct"] = 50.0
+
+    if "occupancy_index" not in df.columns:
+        df["occupancy_index"] = 0.5
+
+    if "is_holiday" not in df.columns:
+        df["is_holiday"] = 0
+
+    return df
 
 
-def _build_filters(data: pd.DataFrame) -> dict[str, object]:
-    """Render sidebar controls and return selections without mutating data."""
-    st.sidebar.header("Filters")
 
-    demo_mode = st.sidebar.toggle(
-        "Demo Mode — real dataset",
-        value=False,
-        help="Select a real high-severity anomaly for a guided presentation path.",
-    )
-    presentation_mode = st.sidebar.toggle(
-        "Presentation mode",
-        value=False,
-        help="Reduce technical helper text while keeping the dashboard controls.",
-    )
+# ============================================================
+# FEATURE ENGINEERING
+# Matches the 35 features used by the trained model.
+# ============================================================
 
-    building_values = sorted(data["building_id"].dropna().astype(str).unique())
-    selected_building = st.sidebar.selectbox(
-        "Building",
-        ["All buildings", *building_values],
-    )
+def create_features(df):
+    data = normalize_columns(df)
 
-    timestamp = pd.to_datetime(data["timestamp"], errors="coerce", utc=True)
-    valid_dates = timestamp.dropna()
-    if valid_dates.empty:
-        date_value = None
-    else:
-        default_start, default_end = _default_date_window(data)
-        date_value = st.sidebar.date_input(
-            "Date range",
-            value=(default_start, default_end),
-            help="Start with a focused window; expand this range for the full history.",
+    if "consumption_kwh" not in data.columns:
+        raise ValueError(
+            "Input data must contain a consumption/energy column."
         )
 
-    hour_range = st.sidebar.slider("Hour range", 0, 23, (0, 23))
-    status = st.sidebar.selectbox(
-        "Anomaly status",
-        ["All observations", "Anomalies only", "Normal only"],
+    data = data.copy()
+
+    if "timestamp" in data.columns:
+        data = data.sort_values(
+            ["meter_id", "timestamp"]
+        ).reset_index(drop=True)
+
+        data["hour"] = data["timestamp"].dt.hour
+        data["day_of_week"] = data["timestamp"].dt.dayofweek
+    else:
+        data["hour"] = 12
+        data["day_of_week"] = 0
+
+    data["is_weekend"] = (
+        data["day_of_week"] >= 5
+    ).astype(int)
+
+    data["is_holiday"] = pd.to_numeric(
+        data["is_holiday"],
+        errors="coerce"
+    ).fillna(0)
+
+    data["temp_c"] = pd.to_numeric(
+        data["temp_c"],
+        errors="coerce"
+    ).fillna(25)
+
+    data["humidity_pct"] = pd.to_numeric(
+        data["humidity_pct"],
+        errors="coerce"
+    ).fillna(50)
+
+    data["occupancy_index"] = pd.to_numeric(
+        data["occupancy_index"],
+        errors="coerce"
+    ).fillna(0.5)
+
+    data["consumption_kwh"] = pd.to_numeric(
+        data["consumption_kwh"],
+        errors="coerce"
     )
 
-    building_type = None
-    if "building_type" in data.columns:
-        type_values = sorted(data["building_type"].dropna().astype(str).unique())
-        building_type = st.sidebar.selectbox(
-            "Building type",
-            ["All building types", *type_values],
+    # Global time-series features.
+    grouped = data.groupby("meter_id")["consumption_kwh"]
+
+    data["lag1_kwh"] = grouped.shift(1)
+
+    data["lag24_kwh"] = grouped.shift(24)
+
+    data["roll24_mean_kwh"] = (
+        grouped.shift(1)
+        .rolling(24)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+    data["roll24_std_kwh"] = (
+        grouped.shift(1)
+        .rolling(24)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+
+    # Meter-specific rolling features.
+    data["meter_roll_12h"] = (
+        grouped.shift(1)
+        .rolling(12)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+    data["meter_roll_24h"] = (
+        grouped.shift(1)
+        .rolling(24)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+    data["meter_roll_48h"] = (
+        grouped.shift(1)
+        .rolling(48)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+    data["meter_std_24h"] = (
+        grouped.shift(1)
+        .rolling(24)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+
+    data["meter_std_48h"] = (
+        grouped.shift(1)
+        .rolling(48)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+
+    # Basic deviations.
+    data["deviation_kwh"] = (
+        data["consumption_kwh"]
+        - data["roll24_mean_kwh"]
+    )
+
+    data["deviation_percentage"] = (
+        data["deviation_kwh"]
+        / data["roll24_mean_kwh"].abs().clip(lower=0.01)
+    ) * 100
+
+    data["change_from_previous"] = (
+        data["consumption_kwh"]
+        - data["lag1_kwh"]
+    )
+
+    data["change_from_previous_pct"] = (
+        data["change_from_previous"]
+        / data["lag1_kwh"].abs().clip(lower=0.01)
+    ) * 100
+
+    data["change_from_24h"] = (
+        data["consumption_kwh"]
+        - data["lag24_kwh"]
+    )
+
+    data["change_from_24h_pct"] = (
+        data["change_from_24h"]
+        / data["lag24_kwh"].abs().clip(lower=0.01)
+    ) * 100
+
+    # Meter-specific deviations.
+    data["meter_deviation_24h"] = (
+        data["consumption_kwh"]
+        - data["meter_roll_24h"]
+    )
+
+    data["meter_deviation_48h"] = (
+        data["consumption_kwh"]
+        - data["meter_roll_48h"]
+    )
+
+    data["meter_deviation_pct"] = (
+        data["meter_deviation_24h"]
+        / data["meter_roll_24h"].abs().clip(lower=0.01)
+    ) * 100
+
+    # Z scores.
+    data["meter_z_score"] = (
+        data["meter_deviation_24h"]
+        / data["meter_std_24h"].abs().clip(lower=0.01)
+    )
+
+    data["meter_z_score_48h"] = (
+        data["meter_deviation_48h"]
+        / data["meter_std_48h"].abs().clip(lower=0.01)
+    )
+
+    data["baseline_z_score"] = (
+        data["deviation_kwh"]
+        / data["roll24_std_kwh"].abs().clip(lower=0.01)
+    )
+
+    # Contextual features.
+    data["occupancy_consumption_ratio"] = (
+        data["consumption_kwh"]
+        / data["occupancy_index"].abs().clip(lower=0.01)
+    )
+
+    data["temp_consumption_interaction"] = (
+        data["temp_c"]
+        * data["consumption_kwh"]
+    )
+
+    # Cyclic time features.
+    data["hour_sin"] = np.sin(
+        2 * np.pi * data["hour"] / 24
+    )
+
+    data["hour_cos"] = np.cos(
+        2 * np.pi * data["hour"] / 24
+    )
+
+    data["day_sin"] = np.sin(
+        2 * np.pi * data["day_of_week"] / 7
+    )
+
+    data["day_cos"] = np.cos(
+        2 * np.pi * data["day_of_week"] / 7
+    )
+
+    return data
+
+
+# ============================================================
+# ANOMALY DETECTION
+# ============================================================
+
+def detect_anomalies(df, model, scaler, features):
+    data = create_features(df)
+
+    missing_features = [
+        f for f in features
+        if f not in data.columns
+    ]
+
+    if missing_features:
+        raise ValueError(
+            "The following model features could not be created: "
+            + ", ".join(missing_features)
         )
+
+    X = data[features].replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    valid_mask = X.notna().all(axis=1)
+
+    if not valid_mask.any():
+        raise ValueError(
+            "No rows contain enough historical data for prediction. "
+            "The trained model needs lag/rolling history."
+        )
+
+    valid = data.loc[valid_mask].copy()
+    X_valid = X.loc[valid_mask]
+
+    X_scaled = scaler.transform(X_valid)
+
+    valid["if_prediction"] = model.predict(X_scaled)
+    valid["if_score"] = model.decision_function(X_scaled)
+
+    valid["anomaly"] = (
+        valid["if_prediction"] == -1
+    ).astype(int)
+
+    valid["status"] = np.where(
+        valid["anomaly"].eq(1),
+        "ANOMALY",
+        "NORMAL"
+    )
+
+    # Baseline is the same 24-hour rolling baseline used by the detector.
+    valid["baseline_kwh"] = valid["meter_roll_24h"]
+
+    valid["deviation_kwh"] = (
+        valid["consumption_kwh"]
+        - valid["baseline_kwh"]
+    )
+
+    valid["excess_energy_kwh"] = (
+        valid["deviation_kwh"]
+        .clip(lower=0)
+    )
+
+    # Severity based on anomaly score.
+    valid["severity"] = "Normal"
+
+    high = (
+        valid["anomaly"].eq(1)
+        & valid["if_score"].lt(-0.15)
+    )
+
+    medium = (
+        valid["anomaly"].eq(1)
+        & valid["if_score"].ge(-0.15)
+    )
+
+    valid.loc[medium, "severity"] = "Medium"
+    valid.loc[high, "severity"] = "High"
+
+    return valid
+
+
+# ============================================================
+# RECOMMENDATIONS
+# ============================================================
+
+def add_recommendations(data):
+    data = data.copy()
+
+    categories = []
+    causes = []
+    recommendations = []
+
+    for _, row in data.iterrows():
+
+        if row["anomaly"] != 1:
+            categories.append("Normal Operation")
+            causes.append(
+                "Consumption aligns with learned operating patterns."
+            )
+            recommendations.append(
+                "No immediate action required."
+            )
+            continue
+
+        occupancy = float(
+            row.get("occupancy_index", 0.5)
+        )
+
+        temp = float(
+            row.get("temp_c", 25)
+        )
+
+        hour = int(
+            row.get("hour", 12)
+        )
+
+        if (
+            hour >= 20 or hour <= 6
+        ) and occupancy < 0.25:
+            categories.append("After-Hours Energy Use")
+            causes.append(
+                "Elevated energy consumption during low-occupancy hours."
+            )
+            recommendations.append(
+                "Check HVAC, lighting, pumps and BMS nighttime schedules."
+            )
+
+        elif occupancy < 0.25:
+            categories.append("Low Occupancy Inefficiency")
+            causes.append(
+                "Energy demand remains high despite low occupancy."
+            )
+            recommendations.append(
+                "Review HVAC setbacks, ventilation controls and lighting."
+            )
+
+        elif temp >= 28:
+            categories.append(
+                "High-Temperature / Thermal Stress"
+            )
+            causes.append(
+                "High outdoor temperature may be increasing cooling demand."
+            )
+            recommendations.append(
+                "Inspect HVAC setpoints, economizer operation and condenser condition."
+            )
+
+        else:
+            categories.append(
+                "General Operational Deviation"
+            )
+            causes.append(
+                "Consumption is unusual relative to the learned baseline."
+            )
+            recommendations.append(
+                "Review sub-meter trends and isolate the equipment or load causing the spike."
+            )
+
+    data["category"] = categories
+    data["possible_cause"] = causes
+    data["recommendation"] = recommendations
+
+    return data
+
+
+# ============================================================
+# IMPACT CALCULATION
+# ============================================================
+
+def calculate_impact(data):
+    total_consumption = float(
+        pd.to_numeric(
+            data["consumption_kwh"],
+            errors="coerce"
+        ).fillna(0).sum()
+    )
+
+    anomaly_count = int(
+        data["anomaly"].sum()
+    )
+
+    total_excess = float(
+        pd.to_numeric(
+            data["excess_energy_kwh"],
+            errors="coerce"
+        ).fillna(0).sum()
+    )
+
+    anomaly_rate = (
+        anomaly_count / len(data) * 100
+        if len(data)
+        else 0
+    )
+
+    # Potential savings are limited to anomalous rows.
+    total_savings = float(
+        data.loc[
+            data["anomaly"].eq(1),
+            "excess_energy_kwh"
+        ].sum()
+    )
 
     return {
-        "building": selected_building,
-        "dates": date_value,
-        "hours": hour_range,
-        "status": status,
-        "building_type": building_type,
-        "demo_mode": demo_mode,
-        "presentation_mode": presentation_mode,
+        "total_consumption_kwh": total_consumption,
+        "anomaly_count": anomaly_count,
+        "total_excess_energy_kwh": total_excess,
+        "total_potential_savings_kwh": total_savings,
+        "anomaly_rate_percent": anomaly_rate,
     }
 
 
-def _apply_filters(data: pd.DataFrame, filters: dict[str, object]) -> pd.DataFrame:
-    """Return a filtered copy while leaving the cached pipeline unchanged."""
-    filtered = data.copy()
-    timestamp = pd.to_datetime(filtered["timestamp"], errors="coerce", utc=True)
-    mask = pd.Series(True, index=filtered.index)
+# ============================================================
+# DATA LOADING
+# ============================================================
 
-    if filters["building"] != "All buildings":
-        mask &= filtered["building_id"].astype(str).eq(filters["building"])
+def load_uploaded_file(uploaded_file):
+    name = uploaded_file.name.lower()
 
-    date_range = filters["dates"]
-    if date_range and len(date_range) == 2:
-        start = pd.Timestamp(date_range[0], tz="UTC")
-        end = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)
-        mask &= timestamp.ge(start) & timestamp.lt(end)
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
 
-    hours = pd.to_numeric(filtered["hour"], errors="coerce")
-    mask &= hours.between(filters["hours"][0], filters["hours"][1])
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(uploaded_file)
 
-    if filters["status"] == "Anomalies only":
-        mask &= filtered["is_anomaly"].fillna(False)
-    elif filters["status"] == "Normal only":
-        mask &= ~filtered["is_anomaly"].fillna(False)
-
-    if filters["building_type"] not in (None, "All building types"):
-        if "building_type" in filtered.columns:
-            mask &= filtered["building_type"].astype(str).eq(filters["building_type"])
-        else:
-            mask &= False
-
-    return filtered.loc[mask].copy()
-
-
-def _render_kpis(data: pd.DataFrame) -> None:
-    """Render KPI cards from the shared impact calculation."""
-    impact = calculate_total_impact(data)
-    with st.container(horizontal=True):
-        st.metric(
-            "Total energy consumption",
-            _format_kwh(impact["total_consumption_kwh"]),
-            border=True,
-        )
-        st.metric(
-            "Detected anomalies",
-            f"{impact['anomaly_count']:,}",
-            border=True,
-        )
-        st.metric(
-            "Potential excess energy",
-            _format_kwh(impact["total_excess_energy_kwh"]),
-            border=True,
-        )
-        st.metric(
-            "Potential savings",
-            _format_kwh(impact["total_potential_savings_kwh"]),
-            border=True,
-        )
-        st.metric(
-            "Anomaly rate",
-            f"{impact['anomaly_rate_percent']:.2f}%",
-            border=True,
-        )
-
-
-def _prepare_chart_data(data: pd.DataFrame, all_buildings: bool) -> pd.DataFrame:
-    """Reduce chart density while retaining anomaly context and hover fields."""
-    chart_data = data.copy()
-    chart_data["timestamp"] = pd.to_datetime(
-        chart_data["timestamp"], errors="coerce", utc=True
-    )
-    chart_data = chart_data.dropna(subset=["timestamp"])
-
-    numeric_columns = [
-        "consumption_kwh",
-        "baseline_kwh",
-        "occupancy_index",
-        "anomaly_score",
-    ]
-    for column in numeric_columns:
-        chart_data[column] = pd.to_numeric(chart_data[column], errors="coerce")
-
-    if not all_buildings:
-        return chart_data.sort_values("timestamp")
-
-    chart_data["anomaly_consumption_kwh"] = chart_data["consumption_kwh"].where(
-        chart_data["is_anomaly"].fillna(False)
-    )
-    chart_data["anomaly_baseline_kwh"] = chart_data["baseline_kwh"].where(
-        chart_data["is_anomaly"].fillna(False)
-    )
-    return (
-        chart_data.groupby("timestamp", as_index=False)
-        .agg(
-            consumption_kwh=("consumption_kwh", "sum"),
-            baseline_kwh=("baseline_kwh", "sum"),
-            occupancy_index=("occupancy_index", "mean"),
-            anomaly_score=("anomaly_score", "max"),
-            anomaly_consumption_kwh=("anomaly_consumption_kwh", "sum"),
-            anomaly_baseline_kwh=("anomaly_baseline_kwh", "sum"),
-        )
-        .sort_values("timestamp")
+    raise ValueError(
+        "Please upload a CSV or Excel file."
     )
 
 
-def _render_consumption_chart(
-    data: pd.DataFrame,
-    presentation_mode: bool = False,
-) -> None:
-    """Render actual, baseline, and anomaly observations in one chart."""
-    st.subheader("Energy consumption")
-    all_buildings = data["building_id"].astype(str).nunique() > 1
-    chart_data = _prepare_chart_data(data, all_buildings)
+@st.cache_data(show_spinner=False)
+def load_default_file(path_string):
+    path = Path(path_string)
 
-    if chart_data.empty:
-        st.info("No valid timestamps are available for the selected filters.")
-        return
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
 
-    customdata = chart_data[
-        ["baseline_kwh", "occupancy_index", "anomaly_score"]
-    ].to_numpy()
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=chart_data["timestamp"],
-            y=chart_data["consumption_kwh"],
-            mode="lines",
-            name="Actual consumption",
-            line={"color": "#1f6f8b", "width": 2},
-            customdata=customdata,
-            hovertemplate=(
-                "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
-                "Actual: %{y:.2f} kWh<br>"
-                "Baseline: %{customdata[0]:.2f} kWh<br>"
-                "Occupancy: %{customdata[1]:.1%}<br>"
-                "Anomaly score: %{customdata[2]:.2f}<extra></extra>"
-            ),
-        )
+    return pd.read_excel(path)
+
+
+# ============================================================
+# FORMATTING
+# ============================================================
+
+def fmt(value, decimals=1):
+    try:
+        if pd.isna(value):
+            return "N/A"
+        return f"{float(value):,.{decimals}f}"
+    except Exception:
+        return "N/A"
+
+
+def safe_string(value):
+    if value is None:
+        return "N/A"
+
+    if isinstance(value, pd.Series):
+        if value.empty:
+            return "N/A"
+        value = value.iloc[0]
+
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except Exception:
+        pass
+
+    return str(value)
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+def render_kpis(data):
+    impact = calculate_impact(data)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "Total Consumption",
+        f"{fmt(impact['total_consumption_kwh'])} kWh"
     )
-    figure.add_trace(
-        go.Scatter(
-            x=chart_data["timestamp"],
-            y=chart_data["baseline_kwh"],
-            mode="lines",
-            name="Baseline",
-            line={"color": "#9aa6b2", "width": 2, "dash": "dot"},
-            hovertemplate="Baseline: %{y:.2f} kWh<extra></extra>",
-        )
+
+    c2.metric(
+        "Anomalies",
+        f"{impact['anomaly_count']:,}"
     )
 
-    if all_buildings:
-        anomaly_data = chart_data.dropna(subset=["anomaly_consumption_kwh"]).copy()
-        anomaly_y = "anomaly_consumption_kwh"
-        anomaly_baseline = "anomaly_baseline_kwh"
-    else:
-        anomaly_data = chart_data[chart_data["is_anomaly"]].copy()
-        anomaly_y = "consumption_kwh"
-        anomaly_baseline = "baseline_kwh"
-
-    if not anomaly_data.empty:
-        anomaly_customdata = anomaly_data[
-            ["occupancy_index", "anomaly_score", anomaly_baseline]
-        ].to_numpy()
-        figure.add_trace(
-            go.Scatter(
-                x=anomaly_data["timestamp"],
-                y=anomaly_data[anomaly_y],
-                mode="markers",
-                name="Anomaly",
-                marker={
-                    "color": "#d1495b",
-                    "size": 12,
-                    "symbol": "diamond",
-                    "line": {"color": "#ffffff", "width": 1},
-                },
-                customdata=anomaly_customdata,
-                hovertemplate=(
-                    "<b>ANOMALY | %{x|%Y-%m-%d %H:%M}</b><br>"
-                    "Actual: %{y:.2f} kWh<br>"
-                    "Baseline: %{customdata[2]:.2f} kWh<br>"
-                    "Occupancy: %{customdata[0]:.1%}<br>"
-                    "Anomaly score: %{customdata[1]:.2f}<extra></extra>"
-                ),
-            )
-        )
-
-    figure.update_layout(
-        height=430,
-        margin={"l": 10, "r": 10, "t": 20, "b": 10},
-        hovermode="x unified",
-        legend={"orientation": "h", "y": 1.08, "x": 0},
-        template="plotly_white",
-        xaxis={"title": "Timestamp", "tickformat": "%b %d\n%H:%M"},
-        yaxis={"title": "Energy (kWh)", "tickformat": ",.0f"},
+    c3.metric(
+        "Excess Energy",
+        f"{fmt(impact['total_excess_energy_kwh'])} kWh"
     )
-    if all_buildings and not presentation_mode:
-        st.caption("All buildings are aggregated by timestamp; anomaly markers show anomalous energy.")
-    st.plotly_chart(figure, width="stretch")
 
-
-def _render_anomaly_detail(row: pd.Series) -> None:
-    """Render the selected anomaly's contextual explanation and impact."""
-    st.header("🚨 Anomaly detected")
-    with st.container(horizontal=True):
-        st.metric("Actual consumption", _format_kwh(row.get("consumption_kwh")), border=True)
-        st.metric("Expected baseline", _format_kwh(row.get("baseline_kwh")), border=True)
-        st.metric("Deviation", _format_kwh(row.get("deviation_kwh")), border=True)
-        st.metric("Occupancy", _display_occupancy(row.get("occupancy_index")), border=True)
-        st.metric(
-            "Potential savings",
-            _format_kwh(row.get("potential_savings_kwh")),
-            border=True,
-        )
-
-    timestamp = row.get("timestamp")
-    timestamp_text = (
-        timestamp.strftime("%Y-%m-%d %H:%M UTC")
-        if isinstance(timestamp, pd.Timestamp) and pd.notna(timestamp)
-        else "N/A"
+    c4.metric(
+        "Potential Savings",
+        f"{fmt(impact['total_potential_savings_kwh'])} kWh"
     )
-    left, right = st.columns(2)
-    with left:
-        st.write(f"**Timestamp:** {timestamp_text}")
-        st.write(f"**Temperature:** {_format_value(row.get('temp_c'), ' °C')}")
-        severity = _format_value(row.get("severity"))
-        if severity != "N/A":
-            st.badge(severity, color="red" if severity == "HIGH" else "orange")
-        else:
-            st.write("**Severity:** N/A")
-    with right:
-        st.write(f"**Category:** {_format_value(row.get('anomaly_category'))}")
-        with st.container(border=True):
-            st.markdown("**Possible cause**")
-            st.write(_format_value(row.get("possible_cause")))
-            st.markdown("**Recommendation**")
-            st.write(_format_value(row.get("recommendation")))
 
-    occupancy = pd.to_numeric(
-        pd.Series([row.get("occupancy_index")]), errors="coerce"
-    ).iloc[0]
-    hour = pd.to_numeric(pd.Series([row.get("hour")]), errors="coerce").iloc[0]
-    deviation = pd.to_numeric(
-        pd.Series([row.get("deviation_kwh")]), errors="coerce"
-    ).iloc[0]
-    deviation_percent = pd.to_numeric(
-        pd.Series([row.get("deviation_percent")]), errors="coerce"
-    ).iloc[0]
-    category = str(row.get("anomaly_category", ""))
-    reasons = []
-    if pd.notna(occupancy) and occupancy < 0.15:
-        reasons.append("low occupancy")
-    if pd.notna(hour) and (hour >= 22 or hour <= 6):
-        reasons.append("after-hours")
-    if pd.notna(deviation) and deviation > 0:
-        reasons.append("consumption above baseline")
-    if "persistent" in category.lower():
-        reasons.append("persistent abnormal consumption")
-    elif not reasons and pd.notna(deviation_percent) and deviation_percent > 0:
-        reasons.append("high consumption relative to baseline")
-    with st.container(border=True):
-        st.markdown("**Why was this flagged?**")
-        st.write(
-            " + ".join(reasons).capitalize() + "."
-            if reasons
-            else "The model marked this observation as anomalous."
-        )
+    c5.metric(
+        "Anomaly Rate",
+        f"{impact['anomaly_rate_percent']:.2f}%"
+    )
 
 
-def _render_anomaly_table(
-    data: pd.DataFrame,
-    demo_mode: bool = False,
-    demo_selection: tuple[object, pd.Series] | None = None,
-) -> None:
-    """Show recent anomalies and provide a robust row-selection control."""
-    st.subheader("Recent anomalies")
-    anomalies = data[data["is_anomaly"]].copy()
+def render_anomaly_table(data):
+    st.subheader("🚨 Detected Energy Anomalies")
+
+    anomalies = data[
+        data["anomaly"].eq(1)
+    ].copy()
+
     if anomalies.empty:
-        st.info("No anomalies match the selected filters.")
-        if demo_mode and demo_selection is not None:
-            st.caption("The real demo anomaly is outside the current filters.")
-            _render_anomaly_detail(demo_selection[1])
+        st.success(
+            "No anomalies were detected in the available valid records."
+        )
         return
 
-    severity_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    anomalies["_severity_rank"] = anomalies["severity"].map(severity_rank).fillna(3)
-    anomalies = anomalies.sort_values(
-        ["_severity_rank", "timestamp"],
-        ascending=[True, False],
-        na_position="last",
-    ).drop(columns="_severity_rank")
-    display_anomalies = anomalies.head(15)
-    demo_index = demo_selection[0] if demo_selection is not None else None
-    if demo_mode and demo_index in anomalies.index and demo_index not in display_anomalies.index:
-        display_anomalies = pd.concat(
-            [anomalies.loc[[demo_index]], display_anomalies]
-        ).drop_duplicates()
-    table = display_anomalies[
-        [
-            "timestamp",
-            "building_id",
-            "consumption_kwh",
-            "baseline_kwh",
-            "deviation_kwh",
-            "anomaly_score",
-            "severity",
-            "anomaly_category",
-        ]
-    ].rename(
-        columns={
-            "building_id": "Building",
-            "timestamp": "Timestamp",
-            "consumption_kwh": "Consumption (kWh)",
-            "baseline_kwh": "Baseline (kWh)",
-            "deviation_kwh": "Deviation (kWh)",
-            "anomaly_score": "Anomaly score",
-            "severity": "Severity",
-            "anomaly_category": "Category",
-        }
+    severity_rank = {
+        "High": 1,
+        "Medium": 2,
+        "Normal": 3,
+        "Low": 3,
+    }
+
+    anomalies["_severity_rank"] = (
+        anomalies["severity"]
+        .astype(str)
+        .map(severity_rank)
+        .fillna(4)
     )
+
+    anomalies = anomalies.sort_values(
+        ["_severity_rank", "if_score"],
+        ascending=[True, True]
+    )
+
+    display = anomalies.copy()
+
+    display["Timestamp"] = (
+        display["timestamp"]
+        .astype(str)
+        if "timestamp" in display.columns
+        else ""
+    )
+
+    display["Building"] = (
+        display["building_id"]
+        .astype(str)
+    )
+
+    display["Consumption (kWh)"] = (
+        display["consumption_kwh"]
+        .round(2)
+    )
+
+    display["Baseline (kWh)"] = (
+        display["baseline_kwh"]
+        .round(2)
+    )
+
+    display["Deviation (kWh)"] = (
+        display["deviation_kwh"]
+        .round(2)
+    )
+
+    display["Anomaly score"] = (
+        display["if_score"]
+        .round(4)
+    )
+
+    display["Severity"] = (
+        display["severity"]
+        .astype(str)
+    )
+
+    display["Category"] = (
+        display["category"]
+        .astype(str)
+    )
+
+    # IMPORTANT:
+    # Select only these columns so duplicate source columns can never
+    # reach Streamlit/Arrow.
+    table = display[
+        [
+            "Timestamp",
+            "Building",
+            "Consumption (kWh)",
+            "Baseline (kWh)",
+            "Deviation (kWh)",
+            "Anomaly score",
+            "Severity",
+            "Category",
+        ]
+    ].copy()
+
+    # Final duplicate-column safety.
+    table = table.loc[
+        :,
+        ~table.columns.duplicated()
+    ]
+
     st.dataframe(
         table,
         width="stretch",
         hide_index=True,
-        column_config={
-            "Consumption (kWh)": st.column_config.NumberColumn(format="%.2f"),
-            "Baseline (kWh)": st.column_config.NumberColumn(format="%.2f"),
-            "Deviation (kWh)": st.column_config.NumberColumn(format="%.2f"),
-            "Anomaly score": st.column_config.NumberColumn(format="%.2f"),
-        },
     )
 
-    labels = []
-    for _, row in display_anomalies.iterrows():
-        timestamp = row.get("timestamp")
-        timestamp_text = (
-            timestamp.strftime("%m/%d %H:%M")
-            if isinstance(timestamp, pd.Timestamp) and pd.notna(timestamp)
-            else "unknown time"
-        )
-        labels.append(
-            f"{row.get('building_id', 'Unknown')} | {timestamp_text} | "
-            f"{_format_kwh(row.get('consumption_kwh'))} | {row.get('anomaly_category', 'Anomaly')}"
-        )
+    st.markdown("---")
+    st.subheader("🔎 Anomaly Details")
 
-    default_index = 0
-    if demo_mode and demo_index in display_anomalies.index:
-        default_index = int(display_anomalies.index.get_loc(demo_index))
-    else:
-        after_hours = display_anomalies["anomaly_category"].eq("After-hours")
-        if after_hours.any():
-            default_index = int(after_hours.to_numpy().argmax())
-    selected_label = st.selectbox(
-        "Select an anomaly to inspect",
-        labels,
-        index=default_index,
+    selected = st.selectbox(
+        "Select an anomaly",
+        options=range(len(anomalies)),
+        format_func=lambda i: (
+            f"{i + 1}. "
+            f"{safe_string(anomalies.iloc[i].get('building_id'))} — "
+            f"{safe_string(anomalies.iloc[i].get('severity'))} — "
+            f"{safe_string(anomalies.iloc[i].get('category'))}"
+        ),
     )
-    selected_position = labels.index(selected_label)
-    _render_anomaly_detail(display_anomalies.iloc[selected_position])
 
+    row = anomalies.iloc[int(selected)]
 
-def _render_investigation_summary(selection: tuple[object, pd.Series]) -> None:
-    """Give presenters a short, data-backed narrative for the selected record."""
-    row = selection[1]
-    building = row.get("building_id", "Unknown")
-    actual = _format_kwh(row.get("consumption_kwh"))
-    baseline = _format_kwh(row.get("baseline_kwh"))
-    savings = _format_kwh(row.get("potential_savings_kwh"))
-    with st.container(border=True):
-        st.markdown("**Investigation summary**")
-        st.caption(
-            f"Real dataset demo · {building} · Follow the signal from normal baseline "
-            "to actionable recommendation."
-        )
-        st.write(
-            f"**Normal consumption:** expected baseline is {baseline}.  "
-            f"**Anomaly detected:** actual consumption is {actual}."
-        )
-        st.write(
-            f"**Context:** {_display_occupancy(row.get('occupancy_index'))} occupancy "
-            f"at hour {_format_value(row.get('hour'))}.  "
-            f"**Outcome:** potential savings are {savings}."
-        )
+    a, b, c, d = st.columns(4)
 
-
-def main() -> None:
-    """Render the dashboard page."""
-    st.title("Commercial Building Energy Copilot")
-    st.caption("AI-powered energy anomaly detection and efficiency recommendations")
-
-    try:
-        data = load_pipeline(str(DATA_PATH))
-    except Exception as exc:
-        st.error(f"Unable to load the energy pipeline: {exc}")
-        st.stop()
-
-    filters = _build_filters(data)
-    filtered = _apply_filters(data, filters)
-    demo_selection = (
-        _select_demo_anomaly(data) if filters["demo_mode"] else None
+    a.metric(
+        "Severity",
+        safe_string(row.get("severity"))
     )
-    if not filters["presentation_mode"]:
-        st.caption(
-            f"Showing {len(filtered):,} of {len(data):,} observations · "
-            "Use the sidebar to expand the analysis window."
-        )
-    if filters["demo_mode"] and demo_selection is not None:
-        _render_investigation_summary(demo_selection)
 
-    _render_kpis(filtered)
+    b.metric(
+        "Consumption",
+        f"{fmt(row.get('consumption_kwh'))} kWh"
+    )
 
-    if filtered.empty:
-        st.info("No observations match the selected filters.")
-        if filters["demo_mode"] and demo_selection is not None:
-            _render_anomaly_table(
-                filtered,
-                demo_mode=True,
-                demo_selection=demo_selection,
-            )
+    c.metric(
+        "Baseline",
+        f"{fmt(row.get('baseline_kwh'))} kWh"
+    )
+
+    d.metric(
+        "Excess Energy",
+        f"{fmt(row.get('excess_energy_kwh'))} kWh"
+    )
+
+    st.write(
+        "**Category:**",
+        safe_string(row.get("category"))
+    )
+
+    st.write(
+        "**Possible cause:**",
+        safe_string(row.get("possible_cause"))
+    )
+
+    st.info(
+        "💡 " + safe_string(row.get("recommendation"))
+    )
+
+
+def render_charts(data):
+    st.subheader("📊 Energy Overview")
+
+    chart_data = data.copy()
+
+    # --------------------------------------------------------
+    # Prepare timestamp
+    # --------------------------------------------------------
+    if "timestamp" not in chart_data.columns:
+        st.warning("Timestamp column is missing from the dataset.")
         return
 
-    _render_consumption_chart(filtered, filters["presentation_mode"])
-    _render_anomaly_table(
-        filtered,
-        demo_mode=filters["demo_mode"],
-        demo_selection=demo_selection,
+    chart_data["timestamp"] = pd.to_datetime(
+        chart_data["timestamp"],
+        errors="coerce"
+    )
+
+    chart_data = chart_data.dropna(subset=["timestamp"])
+
+    # --------------------------------------------------------
+    # Convert numeric columns safely
+    # --------------------------------------------------------
+    for col in ["consumption_kwh", "baseline_kwh"]:
+        if col in chart_data.columns:
+            chart_data[col] = pd.to_numeric(
+                chart_data[col],
+                errors="coerce"
+            )
+
+    chart_data = chart_data.dropna(
+        subset=["consumption_kwh", "baseline_kwh"]
+    )
+
+    if chart_data.empty:
+        st.info("No valid energy data available for the selected filters.")
+        return
+
+    # --------------------------------------------------------
+    # Aggregate readings with the same timestamp
+    # --------------------------------------------------------
+    chart_data = (
+        chart_data
+        .groupby("timestamp", as_index=False)
+        .agg(
+            consumption_kwh=("consumption_kwh", "sum"),
+            baseline_kwh=("baseline_kwh", "sum")
+        )
+        .sort_values("timestamp")
+    )
+
+    # --------------------------------------------------------
+    # Keep the latest 500 time points
+    # --------------------------------------------------------
+    chart_data = chart_data.tail(200)
+
+    # --------------------------------------------------------
+    # Energy consumption vs baseline
+    # --------------------------------------------------------
+    st.caption(
+        "Actual energy consumption compared with the expected baseline. "
+        "Values are aggregated across the selected buildings."
+    )
+
+    energy_chart = (
+        chart_data
+        .set_index("timestamp")[
+            ["consumption_kwh", "baseline_kwh"]
+        ]
+    )
+
+    st.line_chart(
+        energy_chart,
+        height=400
+    )
+
+    # --------------------------------------------------------
+    # Severity distribution
+    # --------------------------------------------------------
+    if "severity" in data.columns:
+
+        severity_data = data.copy()
+
+        # Make sure severity is a simple 1-D Series
+        severity_series = severity_data["severity"]
+
+        if isinstance(severity_series, pd.DataFrame):
+            severity_series = severity_series.iloc[:, 0]
+
+        severity_series = (
+            severity_series
+            .astype(str)
+            .str.strip()
+            .str.title()
+        )
+
+        severity_counts = (
+            severity_series
+            .value_counts()
+            .rename_axis("Severity")
+            .to_frame("Count")
+        )
+
+        # Consistent order
+        severity_order = ["High", "Medium", "Low", "Normal"]
+
+        severity_counts = severity_counts.reindex(
+            severity_order
+        ).fillna(0)
+
+        severity_counts["Count"] = (
+            severity_counts["Count"].astype(int)
+        )
+
+        st.subheader("🚨 Anomaly Severity Distribution")
+
+        st.bar_chart(
+            severity_counts,
+            height=350
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    try:
+        model, scaler, features = load_model_assets()
+    except Exception as exc:
+        st.error("Unable to load the trained model.")
+        st.code(str(exc))
+        st.info(
+            "Make sure this app.py is inside "
+            "C:\\Users\\hp\\commercial-energy-anomaly "
+            "or change MODEL_DIR to your project's model folder."
+        )
+        st.stop()
+
+    st.sidebar.header("⚙️ Data Source")
+
+    uploaded = st.sidebar.file_uploader(
+        "Upload CSV / Excel",
+        type=["csv", "xlsx", "xls"],
+    )
+
+    raw_data = None
+    source_name = None
+
+    if uploaded is not None:
+        try:
+            raw_data = load_uploaded_file(uploaded)
+            source_name = uploaded.name
+        except Exception as exc:
+            st.error(f"Could not read uploaded file: {exc}")
+            st.stop()
+
+    else:
+        existing = [
+            p for p in DEFAULT_DATA_FILES
+            if p.exists()
+        ]
+
+        if existing:
+            selected_default = st.sidebar.selectbox(
+                "Use project data",
+                existing,
+                format_func=lambda p: p.name,
+            )
+
+            try:
+                raw_data = load_default_file(
+                    str(selected_default)
+                )
+                source_name = selected_default.name
+            except Exception as exc:
+                st.error(
+                    f"Could not read {selected_default.name}: {exc}"
+                )
+                st.stop()
+
+        else:
+            st.warning(
+                "Upload a CSV/Excel file or place the trained dataset "
+                "inside the project's data folder."
+            )
+            st.stop()
+
+    st.sidebar.success(
+        f"Loaded: {source_name}"
+    )
+
+    st.sidebar.caption(
+        f"Rows: {len(raw_data):,}"
+    )
+
+    # --------------------------------------------------------
+    # Run model
+    # --------------------------------------------------------
+
+    try:
+        with st.spinner(
+            "Running the trained Isolation Forest model..."
+        ):
+            results = detect_anomalies(
+                raw_data,
+                model,
+                scaler,
+                features,
+            )
+
+            results = add_recommendations(results)
+
+    except Exception as exc:
+        st.error("The energy pipeline could not be completed.")
+        st.exception(exc)
+        st.info(
+            "The trained model requires enough historical rows per meter "
+            "to calculate its lag and rolling features."
+        )
+        st.stop()
+
+    # --------------------------------------------------------
+    # Filters
+    # --------------------------------------------------------
+
+    st.sidebar.header("🔍 Filters")
+
+    filtered = results.copy()
+
+    if "building_id" in filtered.columns:
+        buildings = sorted(
+            filtered["building_id"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        selected_buildings = st.sidebar.multiselect(
+            "Building",
+            buildings,
+            default=buildings,
+        )
+
+        if selected_buildings:
+            filtered = filtered[
+                filtered["building_id"]
+                .astype(str)
+                .isin(selected_buildings)
+            ]
+
+    severities = st.sidebar.multiselect(
+        "Severity",
+        ["High", "Medium", "Normal"],
+        default=["High", "Medium", "Normal"],
+    )
+
+    filtered = filtered[
+        filtered["severity"].isin(severities)
+    ]
+
+    # --------------------------------------------------------
+    # Dashboard
+    # --------------------------------------------------------
+
+    st.caption(
+        f"Analyzing {len(filtered):,} valid records from {source_name}"
+    )
+
+    render_kpis(filtered)
+
+    st.markdown("---")
+
+    render_charts(filtered)
+
+    st.markdown("---")
+
+    render_anomaly_table(filtered)
+
+    # --------------------------------------------------------
+    # Download
+    # --------------------------------------------------------
+
+    st.markdown("---")
+    st.subheader("⬇️ Export Results")
+
+    export = filtered.copy()
+
+    csv = export.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        "Download anomaly results CSV",
+        data=csv,
+        file_name="energy_anomaly_results.csv",
+        mime="text/csv",
     )
 
 

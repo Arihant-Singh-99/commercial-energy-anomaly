@@ -1,5 +1,7 @@
 streamlit>=1.64
-pandas
+pandas>=2.0.0
 numpy
+scikit-learn
+joblib
 plotly
 openpyxl

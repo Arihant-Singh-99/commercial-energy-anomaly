@@ -1,136 +1,70 @@
-"""Energy impact and potential savings calculations."""
+﻿import pandas as pd
+from typing import Optional, List
 
-from __future__ import annotations
+def calculate_potential_savings(
+    data: pd.DataFrame,
+    actual_col: str = "consumption_kwh",
+    baseline_col: str = "baseline_kwh",
+    anomaly_col: str = "anomaly_prediction",
+    price_per_kwh: Optional[float] = None,
+    grid_emission_factor_kg_co2_per_kwh: Optional[float] = None
+) -> pd.DataFrame:
+    df = data.copy()
+    is_anomaly = df[anomaly_col].apply(lambda x: x in (-1, 1, True))
+    
+    excess = (df[actual_col] - df[baseline_col]).clip(lower=0.0)
+    df["potential_savings_kwh"] = (excess * is_anomaly).round(3)
+    
+    if price_per_kwh is not None:
+        df["estimated_potential_cost_savings"] = (df["potential_savings_kwh"] * price_per_kwh).round(2)
+        
+    if grid_emission_factor_kg_co2_per_kwh is not None:
+        df["potential_co2_reduction_kg"] = (df["potential_savings_kwh"] * grid_emission_factor_kg_co2_per_kwh).round(3)
+        
+    return df
 
-import numpy as np
-import pandas as pd
-
-
-def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
-    """Return a numeric series aligned to the input rows."""
-    if column not in df.columns:
-        return pd.Series(np.nan, index=df.index, dtype=float)
-    return pd.to_numeric(df[column], errors="coerce")
-
-
-def _anomaly_mask(df: pd.DataFrame) -> pd.Series:
-    """Use the prepared boolean flag, with prediction-label fallback."""
-    if "is_anomaly" in df.columns:
-        return df["is_anomaly"].fillna(False).astype(bool)
-    if "anomaly_prediction" in df.columns:
-        return _numeric_series(df, "anomaly_prediction").eq(-1)
-    return pd.Series(False, index=df.index, dtype=bool)
-
-
-def _calculated_excess(df: pd.DataFrame) -> pd.Series:
-    """Calculate positive consumption above baseline without division."""
-    consumption = _numeric_series(df, "consumption_kwh")
-    baseline = _numeric_series(df, "baseline_kwh")
-    return (consumption - baseline).clip(lower=0)
-
-
-def calculate_event_savings(df: pd.DataFrame) -> pd.DataFrame:
-    """Add nonnegative potential savings for anomalous observations.
-
-    Existing positive savings values are preserved so a future Team B output
-    can replace this rule without changing the dashboard-facing column.
-    Missing or default zero values are calculated from consumption and baseline.
-    No rows are removed.
-    """
-    result = df.copy()
-    anomaly = _anomaly_mask(result)
-    calculated = _calculated_excess(result).where(anomaly, 0.0)
-
-    if "potential_savings_kwh" in result.columns:
-        existing = pd.to_numeric(
-            result["potential_savings_kwh"],
-            errors="coerce",
-        )
-        preserve_existing = anomaly & existing.gt(0) & existing.notna()
-        result["potential_savings_kwh"] = calculated.where(
-            ~preserve_existing,
-            existing,
-        )
+def aggregate_savings(
+    df: pd.DataFrame,
+    by: str = "day",
+    group_col: Optional[str] = "building_id",
+    timestamp_col: str = "timestamp"
+) -> pd.DataFrame:
+    df_work = df.copy()
+    df_work[timestamp_col] = pd.to_datetime(df_work[timestamp_col])
+    
+    grouping_keys: List[str] = []
+    if group_col and group_col in df_work.columns:
+        grouping_keys.append(group_col)
+        
+    if by == "day":
+        df_work["period"] = df_work[timestamp_col].dt.floor("D")
+        grouping_keys.append("period")
+    elif by == "week":
+        df_work["period"] = df_work[timestamp_col].dt.to_period("W").dt.start_time
+        grouping_keys.append("period")
+    elif by == "month":
+        df_work["period"] = df_work[timestamp_col].dt.to_period("M").dt.start_time
+        grouping_keys.append("period")
+    elif by == "anomaly":
+        if "category" in df_work.columns:
+            grouping_keys.extend(["category", "severity"])
+        else:
+            grouping_keys.append(timestamp_col)
+    elif by == "building":
+        pass
     else:
-        result["potential_savings_kwh"] = calculated
-
-    return result
-
-
-def calculate_total_impact(df: pd.DataFrame) -> dict[str, float | int]:
-    """Return aggregate consumption, excess energy, and anomaly metrics."""
-    if df.empty:
-        return {
-            "total_consumption_kwh": 0.0,
-            "total_excess_energy_kwh": 0.0,
-            "total_potential_savings_kwh": 0.0,
-            "anomaly_count": 0,
-            "total_observations": 0,
-            "anomaly_rate_percent": 0.0,
-        }
-
-    event_data = calculate_event_savings(df)
-    anomaly = _anomaly_mask(event_data)
-    consumption = _numeric_series(event_data, "consumption_kwh")
-    excess = _calculated_excess(event_data).where(anomaly, 0.0)
-    savings = _numeric_series(event_data, "potential_savings_kwh")
-
-    total_observations = len(event_data)
-    anomaly_count = int(anomaly.sum())
-
-    return {
-        "total_consumption_kwh": float(consumption.sum(skipna=True)),
-        "total_excess_energy_kwh": float(excess.sum(skipna=True)),
-        "total_potential_savings_kwh": float(savings.sum(skipna=True)),
-        "anomaly_count": anomaly_count,
-        "total_observations": total_observations,
-        "anomaly_rate_percent": (
-            anomaly_count / total_observations * 100
-        ),
+        raise ValueError(f"Unsupported grouping: '{by}'")
+        
+    agg_targets = {
+        "potential_savings_kwh": "sum",
+        "consumption_kwh": "sum",
+        "baseline_kwh": "sum"
     }
-
-
-def calculate_building_impact(df: pd.DataFrame) -> pd.DataFrame:
-    """Return consumption and anomaly impact metrics grouped by building."""
-    columns = [
-        "building_id",
-        "consumption_kwh",
-        "anomaly_count",
-        "excess_energy_kwh",
-        "potential_savings_kwh",
-    ]
-    if df.empty:
-        return pd.DataFrame(columns=columns)
-
-    event_data = calculate_event_savings(df)
-    working = pd.DataFrame(
-        {
-            "building_id": event_data.get(
-                "building_id",
-                pd.Series("Unknown", index=event_data.index),
-            ),
-            "consumption_kwh": _numeric_series(
-                event_data,
-                "consumption_kwh",
-            ),
-            "anomaly_count": _anomaly_mask(event_data).astype(int),
-            "excess_energy_kwh": _calculated_excess(event_data).where(
-                _anomaly_mask(event_data),
-                0.0,
-            ),
-            "potential_savings_kwh": _numeric_series(
-                event_data,
-                "potential_savings_kwh",
-            ),
-        }
-    )
-
-    return (
-        working.groupby("building_id", dropna=False, as_index=False)
-        .agg(
-            consumption_kwh=("consumption_kwh", "sum"),
-            anomaly_count=("anomaly_count", "sum"),
-            excess_energy_kwh=("excess_energy_kwh", "sum"),
-            potential_savings_kwh=("potential_savings_kwh", "sum"),
-        )
-    )[columns]
+    if "estimated_potential_cost_savings" in df_work.columns:
+        agg_targets["estimated_potential_cost_savings"] = "sum"
+    if "potential_co2_reduction_kg" in df_work.columns:
+        agg_targets["potential_co2_reduction_kg"] = "sum"
+        
+    if grouping_keys:
+        return df_work.groupby(grouping_keys, as_index=False).agg(agg_targets)
+    return pd.DataFrame([df_work[list(agg_targets.keys())].sum()])

@@ -1,9 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
-
-*.csv
-
+.streamlit/secrets.toml
 .env
-
+.vscode/
+.DS_Store
+*.csv
 .ipynb_checkpoints/

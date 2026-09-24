@@ -1,67 +1,207 @@
-# Commercial Building Energy Copilot
+# ⚡ Commercial Building Energy Copilot
 
-## Problem
+An AI-powered energy anomaly detection and investigation system for commercial buildings. The system detects unusual energy consumption, analyzes the surrounding operating conditions, estimates energy impact, and provides actionable recommendations through an interactive Streamlit dashboard.
 
-Commercial buildings produce large volumes of meter and operating data, but unusual energy consumption can be difficult to identify and explain. Operators need to distinguish normal variation from waste, scheduling issues, HVAC problems, and other conditions that may require investigation.
+## 🚨 Problem
 
-## Solution
+Commercial buildings generate large amounts of energy and operational data, but unusual consumption can be difficult to identify manually.
 
-The project turns smart-building observations into an operator-facing investigation workflow:
+Energy waste may be caused by:
 
-Smart Building Data -> Data Preprocessing -> Anomaly Detection -> Contextual Interpretation -> Recommendation -> Potential Savings -> Streamlit Dashboard
+- Inefficient HVAC operation
+- After-hours energy consumption
+- Low-occupancy operation
+- Sudden consumption spikes
+- Persistent deviations from normal usage
 
-The current dashboard uses the supplied Excel dataset. The loader adapts source-specific fields into a unified integration schema, preprocessing keeps rows usable, the recommendation engine applies deterministic contextual rules, and the impact layer estimates avoidable energy above baseline.
+Building operators need a system that can identify these patterns and help prioritize areas for investigation.
 
-## Features
+## 💡 Solution
 
-- Real-time-style energy monitoring
-- Energy anomaly detection
-- Building filtering
-- Date and hour filtering
-- Anomaly severity
-- Contextual explanations
-- Rule-based recommendations
-- Potential savings estimation
-- Interactive Plotly visualization
-- Demo mode using real dataset records
-- Offline operation
-
-## Architecture
+Commercial Building Energy Copilot converts smart-building data into an operator-focused workflow:
 
 ```text
-energy-anomaly/
-|-- data/
-|-- src/
-|   |-- data_loader.py
-|   |-- preprocessing.py
-|   |-- recommendations.py
-|   `-- impact.py
-|-- dashboard/
-|   `-- app.py
-`-- README.md
+Smart Building Data
+        ↓
+Data Preprocessing
+        ↓
+Feature Engineering
+        ↓
+Isolation Forest
+        ↓
+Anomaly Detection
+        ↓
+Contextual Analysis
+        ↓
+Impact & Savings
+        ↓
+Recommendations
+        ↓
+Streamlit Dashboard
 ```
 
-### Module responsibilities
+The system uses an **unsupervised Isolation Forest model**, allowing unusual energy behavior to be detected without requiring manually labelled anomaly data.
 
-- `src/data_loader.py`: Reads the supplied Excel or CSV data, validates source fields, adapts source names to the unified dashboard contract, and adds baseline, anomaly, and deviation fields.
-- `src/preprocessing.py`: Normalizes timestamps and numeric fields, derives missing hours where possible, preserves rows, and creates reusable anomaly/deviation fields.
-- `src/recommendations.py`: Applies deterministic rules for after-hours, low-occupancy, high-consumption, persistent, and fallback anomaly explanations.
-- `src/impact.py`: Calculates event savings, aggregate impact metrics, and building-level impact without producing negative savings.
-- `dashboard/app.py`: Runs the shared pipeline once with Streamlit caching, applies interactive filters, and presents KPIs, charts, anomaly details, recommendations, and savings.
+## ✨ Key Features
 
-## Installation
+- 🤖 Unsupervised ML-based anomaly detection
+- 📊 Consumption vs. baseline visualization
+- 🏢 Multi-building/meter analysis
+- 🔎 Building, date, hour and severity filters
+- 🚨 Anomaly severity classification
+- 🧠 Contextual anomaly explanations
+- 💡 Deterministic energy-efficiency recommendations
+- ⚡ Excess energy estimation
+- 💰 Potential savings estimation
+- 📈 Interactive Plotly charts
+- 🖥️ Streamlit dashboard
+- 📴 Local/offline operation
 
-From Windows PowerShell:
+## 🧠 Machine Learning
+
+The project uses:
+
+**Isolation Forest + RobustScaler**
+
+The trained model analyzes **35 engineered features** covering:
+
+- Current energy consumption
+- Previous-hour and previous-day consumption
+- Rolling consumption statistics
+- Meter-specific historical behavior
+- Consumption deviations
+- Percentage changes
+- Z-scores
+- Temperature
+- Humidity
+- Occupancy
+- Time of day
+- Day of week
+- Weekend/holiday information
+- Cyclic time features
+
+### Model Artifacts
+
+```text
+model/
+├── final_isolation_forest_v2.joblib
+├── final_isolation_forest_scaler_v2.joblib
+└── final_model_features_v2.joblib
+```
+
+## 🏗️ Architecture
+
+```text
+commercial-energy-anomaly/
+│
+├── dashboard/
+│   └── app.py
+│
+├── data/
+│   └── capstone_smartgrid_20000.xlsx
+│
+├── model/
+│   ├── final_isolation_forest_v2.joblib
+│   ├── final_isolation_forest_scaler_v2.joblib
+│   └── final_model_features_v2.joblib
+│
+├── src/
+│   ├── data_loader.py
+│   ├── preprocessing.py
+│   ├── recommendations.py
+│   └── impact.py
+│
+├── isolation_forest_detector.py
+├── pipeline.py
+├── requirements.txt
+└── README.md
+```
+
+### Main Components
+
+**`dashboard/app.py`**  
+Streamlit dashboard containing filters, KPIs, charts, anomaly analysis, recommendations and impact information.
+
+**`isolation_forest_detector.py`**  
+Feature engineering and Isolation Forest inference using the trained model and scaler.
+
+**`src/data_loader.py`**  
+Loads and normalizes the supplied energy dataset.
+
+**`src/preprocessing.py`**  
+Handles timestamps, numeric fields and preprocessing required by the pipeline.
+
+**`src/recommendations.py`**  
+Generates contextual recommendations using deterministic rules.
+
+**`src/impact.py`**  
+Calculates excess energy and potential savings.
+
+## 📊 Dataset
+
+The primary dataset is:
+
+```text
+data/capstone_smartgrid_20000.xlsx
+```
+
+It contains smart-building information including:
+
+- Meter IDs
+- Timestamps
+- Building types
+- Temperature
+- Humidity
+- Occupancy
+- Energy consumption
+- Historical consumption features
+- Solar generation
+- Sensor health
+- Outage risk
+
+The dataset contains **40 unique meters**.
+
+## 🛠️ Tech Stack
+
+- **Python**
+- **Pandas**
+- **NumPy**
+- **Scikit-learn**
+- **Isolation Forest**
+- **RobustScaler**
+- **Streamlit**
+- **Plotly**
+- **OpenPyXL**
+- **Joblib**
+
+## 🚀 Installation
+
+Clone the repository and enter the project directory:
+
+```powershell
+git clone https://github.com/Arihant-Singh-99/commercial-energy-anomaly.git
+cd commercial-energy-anomaly
+```
+
+Create a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install streamlit pandas numpy plotly scikit-learn openpyxl
 ```
 
-The current dashboard directly requires Streamlit, pandas, NumPy, Plotly, and openpyxl. `scikit-learn` is included in the hackathon setup command for compatibility with future Team A model output; the current temporary dataset adapter does not import it.
+Activate it:
 
-## Running
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+## ▶️ Run the Dashboard
 
 From the project root:
 
@@ -69,54 +209,58 @@ From the project root:
 python -m streamlit run dashboard/app.py
 ```
 
-Streamlit starts a local server and opens the dashboard in a browser. The application runs offline and reads `data/capstone_smartgrid_20000.xlsx` from the project directory.
+The dashboard will open in your browser.
 
-## Dataset
+## 🎯 Demo Flow
 
-The dashboard uses the supplied smart-building dataset at:
+For a hackathon demonstration:
+
+1. Launch the Streamlit dashboard.
+2. Select a building using the sidebar.
+3. View energy consumption against the expected baseline.
+4. Apply severity/date/hour filters.
+5. Open a detected anomaly.
+6. Review the anomaly score and severity.
+7. Examine the operating context.
+8. View the likely cause.
+9. Review the recommended action.
+10. View estimated excess energy and potential savings.
+
+## 🧪 Testing
+
+The project can be tested using normal and synthetic anomaly scenarios, including:
+
+- Normal operation
+- After-hours consumption
+- Low-occupancy consumption
+- Sudden consumption spikes
+- Persistent deviations
+- Multiple buildings/meters
+- Missing values
+- Insufficient historical data
+
+Test datasets can be used to demonstrate how the anomaly-detection pipeline responds to different levels of abnormal energy behavior.
+
+## 🎯 Project Goal
+
+The goal is to move beyond simply detecting an anomaly.
 
 ```text
-data/capstone_smartgrid_20000.xlsx
+Detect
+  ↓
+Explain
+  ↓
+Quantify
+  ↓
+Recommend
 ```
 
-The workbook contains meter readings, timestamps, building context, consumption, rolling baseline statistics, anomaly flags, sensor health, and outage risk fields. The illustrative `23:00 / 74 kWh / 24 kWh / 3% occupancy / 50 kWh savings` example is not present in the actual workbook and is not inserted or fabricated by the application.
+Commercial Building Energy Copilot transforms raw building energy data into actionable information that can help operators investigate potential energy waste and improve building efficiency.
 
-## Demo
+---
 
-A concise two-minute presentation flow:
+## 👥 Hackathon Project
 
-1. Open the dashboard.
-2. Enable `Demo Mode - real dataset` in the sidebar.
-3. Show the automatically selected real anomaly.
-4. Explain actual consumption versus the expected baseline.
-5. Point out occupancy and operating hour.
-6. Show the severity.
-7. Show the likely cause.
-8. Show the deterministic recommendation.
-9. Show potential savings.
-10. Change the building or filters to demonstrate scalability.
+**Track:** Energy & Resource Efficiency
 
-The dashboard's Demo Mode selects a real high-severity anomaly, preferably after-hours. It does not add synthetic records.
-
-## Reliability
-
-The dashboard and supporting helpers were tested against:
-
-- Normal observation
-- Single anomaly
-- After-hours anomaly
-- Low-occupancy anomaly
-- Persistent anomaly
-- Different buildings
-- Missing values
-- Zero baseline
-- Empty dataset
-- Building with no anomalies
-
-The dashboard also supports building, date, hour, anomaly status, and building-type filtering where that field is available. The expensive loading and rule-based pipeline is cached with Streamlit.
-
-## Design principle
-
-The core system does not depend on an LLM or external API.
-
-The anomaly detector identifies unusual consumption. The recommendation engine uses deterministic rules and available building context. The impact layer estimates potential avoidable energy. The dashboard communicates the result clearly to the operator.
+**Aligned SDGs:** SDG 7 · SDG 9 · SDG 12 · SDG 13
